@@ -128,6 +128,318 @@ class LipshitzMLP(torch.nn.Module):
 
         return x
 
+
+class RGB(torch.nn.Module):
+
+    def __init__(self, in_channels, boundary_primitive, geom_feat_size_in, nr_iters_for_c2f):
+        super(RGB, self).__init__()
+
+        self.in_channels=in_channels
+        self.boundary_primitive=boundary_primitive
+        self.geom_feat_size_in=geom_feat_size_in
+
+
+        # self.pick_rand_rows= RandRowPicker()
+        # self.pick_rand_pixels= RandPixelPicker(low_discrepancy=False) #do NOT use los discrepancy for now, it seems to align some of the rays to some directions so maybe it's not that good of an idea
+        # self.pixel_sampler=PixelSampler()
+        self.create_rays=CreateRaysModule()
+        self.volume_renderer_neus = VolumeRenderingNeus()
+        self.volume_renderer_trans_neus = VolumeRenderingTransNeus()
+
+        #create encoding
+        pos_dim=in_channels
+        capacity=pow(2,18) #2pow18
+        nr_levels=24 
+        nr_feat_per_level=2 
+        coarsest_scale=1.0 
+        finest_scale=0.0001 
+        scale_list=np.geomspace(coarsest_scale, finest_scale, num=nr_levels)
+        self.encoding=permuto_enc.PermutoEncoding(pos_dim, capacity, nr_levels, nr_feat_per_level, scale_list, appply_random_shift_per_level=True, concat_points=True, concat_points_scaling=1)           
+
+       
+
+        # with dirs encoded
+        # self.mlp= torch.nn.Sequential(
+        #     torch.nn.Linear(self.encoding.output_dims() + 25 + 3 + geom_feat_size_in, 128),
+        #     torch.nn.GELU(),
+        #     torch.nn.Linear(128,128),
+        #     torch.nn.GELU(),
+        #     torch.nn.Linear(128,64),
+        #     torch.nn.GELU(),
+        #     torch.nn.Linear(64,3)
+        # )
+        # apply_weight_init_fn(self.mlp, leaky_relu_init, negative_slope=0.0)
+        # leaky_relu_init(self.mlp[-1], negative_slope=1.0)
+        mlp_in_channels=self.encoding.output_dims() + 25 + 3 + geom_feat_size_in
+        self.mlp=LipshitzMLP(mlp_in_channels, [128,128,64,3], last_layer_linear=True)
+
+        self.c2f=permuto_enc.Coarse2Fine(nr_levels)
+        self.nr_iters_for_c2f=nr_iters_for_c2f
+        self.last_iter_nr=sys.maxsize 
+
+        self.softplus=torch.nn.Softplus()
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, points, samples_dirs, sdf_gradients, geom_feat,  iter_nr, model_colorcal=None, img_indices=None, ray_start_end_idx=None):
+
+     
+
+        assert points.shape[1] == self.in_channels, "points should be N x in_channels"
+
+        self.last_iter_nr=iter_nr
+
+       
+        window=self.c2f( map_range_val(iter_nr, 0.0, self.nr_iters_for_c2f, 0.3, 1.0   ) )
+
+        point_features=self.encoding(points, window.view(-1))
+        #dirs encoded with spherical harmonics 
+        with torch.set_grad_enabled(False):
+            samples_dirs_enc=PermutoSDF.spherical_harmonics(samples_dirs,5)
+        #normals
+        normals=F.normalize( sdf_gradients.view(-1,3), dim=1 )
+
+       
+        x=torch.cat([point_features, samples_dirs_enc, normals, geom_feat],1)
+       
+
+        x=self.mlp(x)
+
+        if model_colorcal is not None:
+            x=model_colorcal.calib_RGB_samples_packed(x, img_indices, ray_start_end_idx )
+        
+
+        x = self.sigmoid(x)
+        
+
+
+        return x
+
+    def path_to_save_model(self, ckpt_folder, experiment_name, iter_nr):
+        models_path=os.path.join(ckpt_folder, experiment_name, str(iter_nr), "models")
+        return models_path
+
+    def save(self, ckpt_folder, experiment_name, iter_nr):
+
+        # models_path=os.path.join(ckpt_folder, experiment_name, str(iter_nr), "models")
+        models_path=self.path_to_save_model(ckpt_folder, experiment_name, iter_nr)
+        os.makedirs(models_path, exist_ok=True)
+        torch.save(self.state_dict(), os.path.join(models_path, "rgb_model.pt")  )
+
+        return models_path 
+
+    def parameters_only_encoding(self):
+        params=[]
+        for name, param in self.encoding.named_parameters():
+            if "lattice_values" in name:
+                params.append(param)
+        return params
+
+    def parameters_all_without_encoding(self):
+        params=[]
+        for name, param in self.named_parameters():
+            if "lattice_values" in name:
+                pass
+            else:
+                params.append(param)
+        return params
+ 
+
+class Geometry(torch.nn.Module):
+
+    def __init__(self, in_channels, boundary_primitive, geom_feat_size_out, nr_iters_for_c2f):
+        super(Geometry, self).__init__()
+
+        self.in_channels=in_channels
+        self.boundary_primitive=boundary_primitive
+        if geom_feat_size_out>=1:
+            self.geom_feat_size_out=geom_feat_size_out
+        else:
+            self.geom_feat_size_out=1
+
+
+        #create encoding
+        pos_dim=in_channels
+        capacity=pow(2,18) #2pow18
+        nr_levels=24 
+        nr_feat_per_level=2 
+        coarsest_scale=1.0 
+        finest_scale=0.0001 
+        scale_list=np.geomspace(coarsest_scale, finest_scale, num=nr_levels)
+        self.encoding=permuto_enc.PermutoEncoding(pos_dim, capacity, nr_levels, nr_feat_per_level, scale_list, appply_random_shift_per_level=True, concat_points=True, concat_points_scaling=1e-3)           
+
+        
+        self.sdf_shift=1e-2
+        self.mlp_in= torch.nn.Sequential(
+            torch.nn.Linear(self.encoding.output_dims() ,32),
+            torch.nn.GELU(),
+        )
+        self.mlp_density= torch.nn.Sequential(
+            torch.nn.Linear(32,32),
+            torch.nn.GELU(),
+            torch.nn.Linear(32,1+geom_feat_size_out),
+            torch.nn.GELU(),
+        )
+        self.mlp_sdf= torch.nn.Sequential(
+            torch.nn.Linear(32,32),
+            torch.nn.GELU(),
+            torch.nn.Linear(32,1+geom_feat_size_out),
+            torch.nn.GELU(),
+        )
+        self.mlp_geom_feat= torch.nn.Sequential(
+            torch.nn.Linear(geom_feat_size_out+geom_feat_size_out,geom_feat_size_out)
+        )
+        apply_weight_init_fn(self.mlp_sdf, leaky_relu_init, negative_slope=0.0)
+        leaky_relu_init(self.mlp_sdf[-1], negative_slope=1.0)
+        with torch.set_grad_enabled(False):
+            self.mlp_sdf[-1].bias+=self.sdf_shift #faster if we just put it in the bias
+
+        # self.mlp_sdf=torch.compile(self.mlp_sdf, mode="max-autotune")
+
+       
+
+
+        self.c2f=permuto_enc.Coarse2Fine(nr_levels)
+        self.nr_iters_for_c2f=nr_iters_for_c2f
+        self.last_iter_nr=sys.maxsize
+
+    def forward(self, points, iter_nr):
+
+        assert points.shape[1] == self.in_channels, "points should be N x in_channels"
+
+        self.last_iter_nr=iter_nr
+
+       
+        window=self.c2f( map_range_val(iter_nr, 0.0, self.nr_iters_for_c2f, 0.3, 1.0   ) )
+
+     
+        point_features=self.encoding(points, window.view(-1))
+        in_feat=self.mlp_in(point_features)
+        density_and_feat=self.mlp_density(in_feat)
+        sdf_and_feat=self.mlp_sdf(in_feat)
+        
+        density=density_and_feat[:,0:1]
+        density=self.softplus(density) #similar to mipnerf
+        sdf=sdf_and_feat[:,0:1]
+        geom_feat_density=density_and_feat[:,-self.geom_feat_size_out:]
+        geom_feat_sdf=sdf_and_feat[:,-self.geom_feat_size_out:]
+
+        geom_feat=self.mlp_geom_feat(torch.cat([geom_feat_density,geom_feat_sdf],1))
+
+        return sdf, density, geom_feat
+
+    def get_sdf_density_and_gradient(self, points, iter_nr, method="autograd"):
+
+
+        if method=="finite_difference":
+            with torch.set_grad_enabled(False):
+                #to the original positions, add also a tiny epsilon in all directions
+                nr_points_original=points.shape[0]
+                epsilon=1e-4
+                points_xplus=points.clone()
+                points_yplus=points.clone()
+                points_zplus=points.clone()
+                points_xplus[:,0]=points_xplus[:,0]+epsilon
+                points_yplus[:,1]=points_yplus[:,1]+epsilon
+                points_zplus[:,2]=points_zplus[:,2]+epsilon
+                points_full=torch.cat([points, points_xplus, points_yplus, points_zplus],0)
+
+               
+            sdf_full, density, geom_feat_full = self.forward(points_full, iter_nr)
+
+            geom_feat=None
+            if geom_feat_full is not None:            
+                g_feats=geom_feat_full.chunk(4, dim=0) 
+                geom_feat=g_feats[0]
+
+            sdfs=sdf_full.chunk(4, dim=0) 
+            sdf=sdfs[0]
+            sdf_xplus=sdfs[1]
+            sdf_yplus=sdfs[2]
+            sdf_zplus=sdfs[3]
+
+            grad_x=(sdf_xplus-sdf)/epsilon
+            grad_y=(sdf_yplus-sdf)/epsilon
+            grad_z=(sdf_zplus-sdf)/epsilon
+
+            gradients=torch.cat([grad_x, grad_y, grad_z],1)
+
+
+        elif method=="autograd":
+
+            #do it with autograd
+            with torch.set_grad_enabled(True):
+                points.requires_grad_(True)
+                sdf, density, geom_feat = self.forward(points, iter_nr)
+
+                feature_vectors=None
+                d_output = torch.ones_like(sdf, requires_grad=False, device=sdf.device)
+                gradients = torch.autograd.grad(
+                    outputs=sdf,
+                    inputs=points,
+                    grad_outputs=d_output,
+                    create_graph=True,
+                    retain_graph=True,
+                    only_inputs=True)[0]
+        else:
+            print("method not known")
+            exit(1)
+
+
+
+
+        return sdf, gradients, density, geom_feat
+
+    def get_sdf_and_curvature_1d_precomputed_gradient_normal_based(self, points, sdf_gradients,iter_nr):
+        #get the curvature along a certain random direction for each point
+        #does it by computing the normal at a shifted point on the tangent plant and then computing a dot produt
+
+
+
+        #to the original positions, add also a tiny epsilon 
+        nr_points_original=points.shape[0]
+        epsilon=1e-4
+        rand_directions=torch.randn_like(points)
+        rand_directions=F.normalize(rand_directions,dim=-1)
+
+        #instead of random direction we take the normals at these points, and calculate a random vector that is orthogonal 
+        normals=F.normalize(sdf_gradients,dim=-1)
+        # normals=normals.detach()
+        tangent=torch.cross(normals, rand_directions)
+        rand_directions=tangent #set the random moving direction to be the tangent direction now
+        
+
+        points_shifted=points.clone()+rand_directions*epsilon
+        
+        #get the gradient at the shifted point
+        sdf_shifted, sdf_gradients_shifted, _, _=self.get_sdf_density_and_gradient(points_shifted, iter_nr) 
+
+        normals_shifted=F.normalize(sdf_gradients_shifted,dim=-1)
+
+        dot=(normals*normals_shifted).sum(dim=-1, keepdim=True)
+        #the dot would assign low weight importance to normals that are almost the same, and increasing error the more they deviate. So it's something like and L2 loss. But we want a L1 loss so we get the angle, and then we map it to range [0,1]
+        angle=torch.acos(torch.clamp(dot, -1.0+1e-6, 1.0-1e-6)) #goes to range 0 when the angle is the same and pi when is opposite
+
+
+        curvature=angle/math.pi #map to [0,1 range]
+
+        return sdf_shifted, curvature
+
+    def path_to_save_model(self, ckpt_folder, experiment_name, iter_nr):
+        models_path=os.path.join(ckpt_folder, experiment_name, str(iter_nr), "models")
+        return models_path
+
+    def save(self, ckpt_folder, experiment_name, iter_nr):
+
+        # models_path=os.path.join(ckpt_folder, experiment_name, str(iter_nr), "models")
+        models_path=self.path_to_save_model(ckpt_folder, experiment_name, iter_nr)
+        os.makedirs(models_path, exist_ok=True)
+        torch.save(self.state_dict(), os.path.join(models_path, "sdf_model.pt")  )
+
+        return models_path 
+
+  
+################### NEUS ################################
+
 class SDF(torch.nn.Module):
 
     def __init__(self, in_channels, boundary_primitive, geom_feat_size_out, nr_iters_for_c2f):
@@ -306,122 +618,8 @@ class SDF(torch.nn.Module):
 
         return models_path 
 
-class RGB(torch.nn.Module):
-
-    def __init__(self, in_channels, boundary_primitive, geom_feat_size_in, nr_iters_for_c2f):
-        super(RGB, self).__init__()
-
-        self.in_channels=in_channels
-        self.boundary_primitive=boundary_primitive
-        self.geom_feat_size_in=geom_feat_size_in
-
-
-        # self.pick_rand_rows= RandRowPicker()
-        # self.pick_rand_pixels= RandPixelPicker(low_discrepancy=False) #do NOT use los discrepancy for now, it seems to align some of the rays to some directions so maybe it's not that good of an idea
-        # self.pixel_sampler=PixelSampler()
-        self.create_rays=CreateRaysModule()
-        self.volume_renderer_neus = VolumeRenderingNeus()
-
-        #create encoding
-        pos_dim=in_channels
-        capacity=pow(2,18) #2pow18
-        nr_levels=24 
-        nr_feat_per_level=2 
-        coarsest_scale=1.0 
-        finest_scale=0.0001 
-        scale_list=np.geomspace(coarsest_scale, finest_scale, num=nr_levels)
-        self.encoding=permuto_enc.PermutoEncoding(pos_dim, capacity, nr_levels, nr_feat_per_level, scale_list, appply_random_shift_per_level=True, concat_points=True, concat_points_scaling=1)           
-
-       
-
-        # with dirs encoded
-        # self.mlp= torch.nn.Sequential(
-        #     torch.nn.Linear(self.encoding.output_dims() + 25 + 3 + geom_feat_size_in, 128),
-        #     torch.nn.GELU(),
-        #     torch.nn.Linear(128,128),
-        #     torch.nn.GELU(),
-        #     torch.nn.Linear(128,64),
-        #     torch.nn.GELU(),
-        #     torch.nn.Linear(64,3)
-        # )
-        # apply_weight_init_fn(self.mlp, leaky_relu_init, negative_slope=0.0)
-        # leaky_relu_init(self.mlp[-1], negative_slope=1.0)
-        mlp_in_channels=self.encoding.output_dims() + 25 + 3 + geom_feat_size_in
-        self.mlp=LipshitzMLP(mlp_in_channels, [128,128,64,3], last_layer_linear=True)
-
-        self.c2f=permuto_enc.Coarse2Fine(nr_levels)
-        self.nr_iters_for_c2f=nr_iters_for_c2f
-        self.last_iter_nr=sys.maxsize 
-
-        self.softplus=torch.nn.Softplus()
-        self.sigmoid = torch.nn.Sigmoid()
-
-    def forward(self, points, samples_dirs, sdf_gradients, geom_feat,  iter_nr, model_colorcal=None, img_indices=None, ray_start_end_idx=None):
-
-     
-
-        assert points.shape[1] == self.in_channels, "points should be N x in_channels"
-
-        self.last_iter_nr=iter_nr
-
-       
-        window=self.c2f( map_range_val(iter_nr, 0.0, self.nr_iters_for_c2f, 0.3, 1.0   ) )
-
-        point_features=self.encoding(points, window.view(-1))
-        #dirs encoded with spherical harmonics 
-        with torch.set_grad_enabled(False):
-            samples_dirs_enc=PermutoSDF.spherical_harmonics(samples_dirs,5)
-        #normals
-        normals=F.normalize( sdf_gradients.view(-1,3), dim=1 )
-
-       
-        x=torch.cat([point_features, samples_dirs_enc, normals, geom_feat],1)
-       
-
-        x=self.mlp(x)
-
-        if model_colorcal is not None:
-            x=model_colorcal.calib_RGB_samples_packed(x, img_indices, ray_start_end_idx )
-        
-
-        x = self.sigmoid(x)
-        
-
-
-        return x
-
-    def path_to_save_model(self, ckpt_folder, experiment_name, iter_nr):
-        models_path=os.path.join(ckpt_folder, experiment_name, str(iter_nr), "models")
-        return models_path
-
-    def save(self, ckpt_folder, experiment_name, iter_nr):
-
-        # models_path=os.path.join(ckpt_folder, experiment_name, str(iter_nr), "models")
-        models_path=self.path_to_save_model(ckpt_folder, experiment_name, iter_nr)
-        os.makedirs(models_path, exist_ok=True)
-        torch.save(self.state_dict(), os.path.join(models_path, "rgb_model.pt")  )
-
-        return models_path 
-
-    def parameters_only_encoding(self):
-        params=[]
-        for name, param in self.encoding.named_parameters():
-            if "lattice_values" in name:
-                params.append(param)
-        return params
-
-    def parameters_all_without_encoding(self):
-        params=[]
-        for name, param in self.named_parameters():
-            if "lattice_values" in name:
-                pass
-            else:
-                params.append(param)
-        return params
-                
-
-
-###################NERF ################################
+               
+################### NERF ################################
 class NerfHash(torch.nn.Module):
 
     def __init__(self, in_channels, boundary_primitive, nr_iters_for_c2f):
@@ -672,7 +870,6 @@ class DeferredRender(torch.nn.Module):
         models_path=os.path.join(root_folder,"checkpoints/", experiment_name, str(iter_nr), "models")
         os.makedirs(models_path, exist_ok=True)
         torch.save(self.state_dict(), os.path.join(models_path, "deferred_render_model.pt")  )
-
 
 
 class Colorcal(torch.nn.Module):

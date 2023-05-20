@@ -181,5 +181,75 @@ class VolumeRenderingNeus(torch.nn.Module):
     def get_last_inv_s(self):
         return self.last_inv_s.view(-1)
 
+class VolumeRenderingTransNeus(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        init_val=0.3
+
+        self.deviation_network = SingleVarianceNetwork(init_val = init_val).cuda()
+
+        self.cumprod_alpha2transmittance_module=CumprodAlpha2TransmittanceModule()
+        self.integrator_module=IntegrateWithWeightsModule()
+        self.sum_ray_module=SumOverRayModule()
+
+        self.last_inv_s=None
+
+    def compute_weights(self, ray_samples_packed, sdf, gradients, density_samples, cos_anneal_ratio, forced_variance=None ):
+
+        nr_samples_total=ray_samples_packed.samples_pos.shape[0]
+        dists=ray_samples_packed.samples_dt
+        
+        d = torch.exp(-density_samples * dists)
+
+        #single parameter 
+        inv_s = self.deviation_network(forced_variance )           # Single parameter
+        inv_s=inv_s.clip(1e-6, 1e6)
+        self.last_inv_s=inv_s
+
+        true_cos = (ray_samples_packed.samples_dirs * gradients).sum(-1, keepdim=True)
+
+        # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
+        # the cos value "not dead" at the beginning training iterations, for better convergence.
+        iter_cos = -(F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
+                     F.relu(-true_cos) * cos_anneal_ratio)  # always non-positive
+
+        # https://github.com/Totoro97/NeuS/issues/35
+        #useful for the womask setting
+        # iter_cos = -(torch.abs(-true_cos))  # always non-positive
+
+        # Estimate signed distances at section points
+        estimated_next_sdf = sdf + iter_cos * dists.reshape(-1, 1) * 0.5
+        estimated_prev_sdf = sdf - iter_cos * dists.reshape(-1, 1) * 0.5
+
+        prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
+        next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
+
+        p = prev_cdf - next_cdf
+        c = prev_cdf
+
+        alpha = ((p + 1e-5) * d / (c + 1e-5)).clip(0.0, 1.0)
+
+
+        transmittance, bg_transmittance= self.cumprod_alpha2transmittance_module(ray_samples_packed, 1-alpha + 1e-7)
+
+       
+        weights = alpha * transmittance
+        weights=weights.view(-1,1)
+        
+
+        weights_sum, weight_sum_per_sample=self.sum_ray_module(ray_samples_packed, weights)
+
+        return weights, weights_sum, bg_transmittance, inv_s
+
+    def integrate(self, ray_samples_packed, samples_vals, weights):
+        integrated=self.integrator_module(ray_samples_packed, samples_vals, weights)
+
+        return integrated
+
+    def get_last_inv_s(self):
+        return self.last_inv_s.view(-1)
+
+
 
 
