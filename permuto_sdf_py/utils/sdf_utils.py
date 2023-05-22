@@ -117,7 +117,7 @@ def sdf_loss_spheres(offsurface_points, offsurface_sdf, offsurface_sdf_gradients
 
 
 #sdf multiplier is preferred to be <1 so that we take more conservative steps and don't overshoot the surface
-def sphere_trace(nr_sphere_traces, ray_origins, ray_dirs, model, return_gradients, sdf_multiplier, sdf_converged_tresh, occupancy_grid=None, time_val=None):
+def sphere_trace(nr_sphere_traces, ray_origins, ray_dirs, model, return_gradients, sdf_multiplier, sdf_converged_tresh, occupancy_grid=None, time_val=None, isTrans=False):
 
 	ray_points_entry, ray_t_entry, ray_points_exit, ray_t_exit, is_hit_valid=model.boundary_primitive.ray_intersection(ray_origins, ray_dirs)
 
@@ -199,11 +199,17 @@ def sphere_trace(nr_sphere_traces, ray_origins, ray_dirs, model, return_gradient
 	if return_gradients:
 		with torch.set_grad_enabled(True):
 			# sdf, sdf_gradients, feat =model.get_sdf_and_gradient(points.detach(), model.last_iter_nr)
-			sdf, sdf_gradients, geom_feat =model.get_sdf_and_gradient(pts_with_potential_time, model.last_iter_nr)
+			if isTrans:
+				sdf, sdf_gradients, density, geom_feat =model.get_sdf_density_and_gradient(pts_with_potential_time, model.last_iter_nr)
+			else:
+				sdf, sdf_gradients, geom_feat =model.get_sdf_and_gradient(pts_with_potential_time, model.last_iter_nr)
 			sdf_gradients=sdf_gradients.detach()
 			sdf_gradients=sdf_gradients[:,0:3]
 	else:
-		sdf, geom_feat=model(pts_with_potential_time, model.last_iter_nr)
+		if isTrans:
+			sdf, density, geom_feat=model(pts_with_potential_time, model.last_iter_nr)
+		else:
+			sdf, geom_feat=model(pts_with_potential_time, model.last_iter_nr)
 		sdf_gradients=None
 
 	#get also a t value for the ray
@@ -215,6 +221,8 @@ def sphere_trace(nr_sphere_traces, ray_origins, ray_dirs, model, return_gradient
 
 	ray_samples_packed.samples_pos=pts
 
+	if isTrans:
+		return pts, sdf, sdf_gradients, density, geom_feat, ray_samples_packed
 	return pts, sdf, sdf_gradients, geom_feat, ray_samples_packed
 
 #if the sdf is outside of a threshold, set the ray_end and gradient to zero

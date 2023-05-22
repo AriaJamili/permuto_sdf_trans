@@ -211,7 +211,7 @@ def run_net_in_chunks(frame, chunk_size, args, hyperparams, model_geo, model_rgb
 def run_net_sphere_traced(frame, args, hyperparams, model_geo, model_rgb, model_bg, occupancy_grid, iter_nr_for_anneal, cos_anneal_ratio, forced_variance,  nr_sphere_traces, sdf_multiplier, sdf_converged_tresh):
     ray_origins, ray_dirs=model_rgb.create_rays(frame, rand_indices=None)
   
-    ray_end, ray_end_sdf, ray_end_gradient, geom_feat_end, traced_samples_packed=sphere_trace(nr_sphere_traces, ray_origins, ray_dirs, model_geo, return_gradients=True, sdf_multiplier=sdf_multiplier, sdf_converged_tresh=sdf_converged_tresh, occupancy_grid=occupancy_grid)
+    ray_end, ray_end_sdf, ray_end_gradient, ray_end_density, geom_feat_end, traced_samples_packed=sphere_trace(nr_sphere_traces, ray_origins, ray_dirs, model_geo, return_gradients=True, sdf_multiplier=sdf_multiplier, sdf_converged_tresh=sdf_converged_tresh, occupancy_grid=occupancy_grid, isTrans=True)
     #check if we are in occupied space with the traced samples
     is_within_bounds= model_geo.boundary_primitive.check_point_inside_primitive(ray_end)
     if hyperparams.use_occupancy_grid:
