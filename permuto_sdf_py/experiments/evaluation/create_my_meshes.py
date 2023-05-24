@@ -32,6 +32,7 @@ import permuto_sdf
 from permuto_sdf  import TrainParams
 from permuto_sdf  import OccupancyGrid
 from permuto_sdf_py.models.models import SDF
+from permuto_sdf_py.models.models import Geometry
 from permuto_sdf_py.models.models import RGB
 from permuto_sdf_py.models.models import NerfHash
 from permuto_sdf_py.models.models import Colorcal
@@ -59,7 +60,7 @@ config_path=os.path.join( os.path.dirname( os.path.realpath(__file__) ) , '../..
 
 def extract_mesh_and_transform_to_original_tf(model, nr_points_per_dim, loader, aabb):
 
-    if isinstance(model, SDF):
+    if isinstance(model, SDF) or isinstance(model, Geometry):
         extracted_mesh=extract_mesh_from_sdf_model(model, nr_points_per_dim=nr_points_per_dim, min_val=-0.5, max_val=0.5)
     elif isinstance(model, INGP):
         extracted_mesh=extract_mesh_from_density_model(model, nr_points_per_dim=nr_points_per_dim, min_val=-0.5, max_val=0.5, threshold=40)
@@ -91,6 +92,7 @@ def run():
     parser.add_argument('--dataset', required=True,  default="",  help="dataset which can be dtu or bmvs")
     parser.add_argument('--comp_name', required=True,  help='Tells which computer are we using which influences the paths for finding the data')
     parser.add_argument('--res', required=True,  help="Resolution of the mesh, usually t least 700")
+    parser.add_argument('--trans_model', action='store_true', help="Set this to true in order to eval Trans Model")
     parser.add_argument('--with_mask', action='store_true', help="Set this to true in order to train with a mask")
     args = parser.parse_args()
     hyperparams=HyperParamsPermutoSDF()
@@ -122,7 +124,10 @@ def run():
     
 
     #params for rendering
-    model_sdf=SDF(in_channels=3, boundary_primitive=aabb, geom_feat_size_out=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.sdf_nr_iters_for_c2f).to("cuda")
+    if args.trans_model:
+        model_sdf=Geometry(in_channels=3, boundary_primitive=aabb, geom_feat_size_out=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.sdf_nr_iters_for_c2f).to("cuda")
+    else:
+        model_sdf=SDF(in_channels=3, boundary_primitive=aabb, geom_feat_size_out=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.sdf_nr_iters_for_c2f).to("cuda")
     model_rgb=RGB(in_channels=3, boundary_primitive=aabb, geom_feat_size_in=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.rgb_nr_iters_for_c2f).to("cuda")
     model_bg=NerfHash(4, boundary_primitive=aabb, nr_iters_for_c2f=hyperparams.background_nr_iters_for_c2f ).to("cuda") 
     if hyperparams.use_occupancy_grid:
