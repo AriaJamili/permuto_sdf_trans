@@ -27,8 +27,10 @@ from permuto_sdf  import Sphere
 from permuto_sdf  import VolumeRendering
 from permuto_sdf_py.schedulers.multisteplr import MultiStepLR
 from permuto_sdf_py.schedulers.warmup import GradualWarmupScheduler
-from permuto_sdf_py.models.models import Geometry
-from permuto_sdf_py.models.models import RGB
+from permuto_sdf_py.models.models import GeometryA
+from permuto_sdf_py.models.models import GeometryB
+from permuto_sdf_py.models.models import GeometryC
+from permuto_sdf_py.models.models import Texture
 from permuto_sdf_py.models.models import NerfHash
 from permuto_sdf_py.models.models import Colorcal
 from permuto_sdf_py.utils.sdf_utils import sdf_loss
@@ -272,9 +274,15 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
     ]
     phase=phases[0] #we usually switch between training and eval phases but here we only train
 
-    #model 
-    model_geo=Geometry(in_channels=3, boundary_primitive=aabb, geom_feat_size_out=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.sdf_nr_iters_for_c2f).to("cuda")
-    model_rgb=RGB(in_channels=3, boundary_primitive=aabb, geom_feat_size_in=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.rgb_nr_iters_for_c2f).to("cuda")
+    #model
+    if args.model == "A": 
+        model_geo=GeometryA(in_channels=3, boundary_primitive=aabb, geom_feat_size_out=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.sdf_nr_iters_for_c2f).to("cuda")
+    elif args.model == "B": 
+        model_geo=GeometryB(in_channels=3, boundary_primitive=aabb, geom_feat_size_out=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.sdf_nr_iters_for_c2f).to("cuda")
+    else:
+        model_geo=GeometryC(in_channels=3, boundary_primitive=aabb, geom_feat_size_out=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.sdf_nr_iters_for_c2f).to("cuda")
+
+    model_rgb=Texture(in_channels=3, boundary_primitive=aabb, geom_feat_size_in=hyperparams.sdf_geom_feat_size, nr_iters_for_c2f=hyperparams.rgb_nr_iters_for_c2f).to("cuda")
     model_bg=NerfHash(4, boundary_primitive=aabb, nr_iters_for_c2f=hyperparams.background_nr_iters_for_c2f ).to("cuda") 
     if hyperparams.use_color_calibration:
         # model_colorcal=Colorcal(loader_train.nr_samples(), 0)
@@ -339,7 +347,7 @@ def train(args, config_path, hyperparams, train_params, loader_train, experiment
 
 
             TIME_START("run_net")
-            pred_rgb, pred_rgb_bg, pred_normals, sdf_gradients, weights_sum, fg_ray_samples_packed  =run_net(args, hyperparams, ray_origins, ray_dirs, img_indices, model_geo, model_rgb, model_bg, model_colorcal, occupancy_grid, iter_nr_for_anneal,  cos_anneal_ratio, forced_variance)
+            pred_rgb, pred_rgb_bg, pred_normals, sdf_gradients, weights_sum, fg_ray_samples_packed  = run_net(args, hyperparams, ray_origins, ray_dirs, img_indices, model_geo, model_rgb, model_bg, model_colorcal, occupancy_grid, iter_nr_for_anneal,  cos_anneal_ratio, forced_variance)
             TIME_END("run_net")
             
 
@@ -549,6 +557,7 @@ def run():
     parser = argparse.ArgumentParser(description='Train sdf and color')
     parser.add_argument('--dataset', required=True, help='Dataset like bmvs, dtu, multiface')
     parser.add_argument('--scene', required=True, help='Scene name like dtu_scan24')
+    parser.add_argument('--model', required=True, help='Which model to train ["A", "B", "C"]')
     parser.add_argument('--comp_name', required=True,  help='Tells which computer are we using which influences the paths for finding the data')
     parser.add_argument('--low_res', action='store_true', help="Use_low res images for training for when you have little GPU memory")
     parser.add_argument('--exp_info', default="", help='Experiment info string useful for distinguishing one experiment for another')
@@ -564,6 +573,7 @@ def run():
 
 
     print("args.with_mask", args.with_mask)
+    print("args.model", args.model)
     print("args.low_res", args.low_res)
     print("checkpoint_path",checkpoint_path)
     print("with_viewer", with_viewer)
